@@ -1,0 +1,667 @@
+(globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push(["object"==typeof document?document.currentScript:void 0,[802879,e=>{let t=String.raw`function (W) {
+  'use strict';
+  var Native = W.WebSocket;
+  if (!Native || Native.__freebuffTty) return;
+  var NATIVE_OPEN_TIMEOUT_MS = 8000;
+  var SEGMENT = '__freebuff_tty/';
+  // Sticky for the page once the fallback has worked: a reconnect after a
+  // dropped session goes straight to the transport that is known to work.
+  var preferHttp = false;
+  var encoder = new TextEncoder();
+  var decoder = new TextDecoder();
+
+  function encodeRecords(items) {
+    var total = 0;
+    for (var i = 0; i < items.length; i++) total += 5 + items[i].bytes.length;
+    var out = new Uint8Array(total);
+    var view = new DataView(out.buffer);
+    var off = 0;
+    for (var j = 0; j < items.length; j++) {
+      out[off] = items[j].type;
+      view.setUint32(off + 1, items[j].bytes.length);
+      out.set(items[j].bytes, off + 5);
+      off += 5 + items[j].bytes.length;
+    }
+    return out;
+  }
+
+  function toBytes(data) {
+    if (typeof data === 'string') return { type: 1, bytes: encoder.encode(data) };
+    if (data instanceof ArrayBuffer) return { type: 2, bytes: new Uint8Array(data.slice(0)) };
+    if (ArrayBuffer.isView(data)) return { type: 2, bytes: new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)) };
+    return null;
+  }
+
+  class FreebuffTtySocket extends EventTarget {
+    constructor(url, protocols) {
+      var parsed;
+      try { parsed = new URL(String(url), W.location.href); } catch (_) { parsed = null; }
+      // Only ttyd's own socket (same host, path ending in /ws) is wrapped.
+      if (!parsed || parsed.host !== W.location.host || !/\/ws$/.test(parsed.pathname)) {
+        return protocols === undefined ? new Native(url) : new Native(url, protocols);
+      }
+      super();
+      this.url = parsed.href;
+      this.protocol = '';
+      this.extensions = '';
+      this.readyState = 0;
+      this.bufferedAmount = 0;
+      this.onopen = null;
+      this.onmessage = null;
+      this.onclose = null;
+      this.onerror = null;
+      this._binaryType = 'blob';
+      this._base = W.location.origin + parsed.pathname.slice(0, -2) + SEGMENT;
+      this._search = parsed.search;
+      this._native = null;
+      this._sid = null;
+      this._outbox = [];
+      this._sending = false;
+      this._pollFailures = 0;
+      if (preferHttp) this._openHttp();
+      else this._openNative(protocols);
+    }
+
+    get binaryType() { return this._binaryType; }
+    set binaryType(value) {
+      this._binaryType = value;
+      if (this._native) this._native.binaryType = value;
+    }
+
+    _emit(type, init) {
+      var event =
+        type === 'message' ? new MessageEvent('message', init) :
+        type === 'close' ? new CloseEvent('close', init) :
+        new Event(type);
+      var handler = this['on' + type];
+      if (typeof handler === 'function') handler.call(this, event);
+      this.dispatchEvent(event);
+    }
+
+    _openNative(protocols) {
+      var self = this;
+      var ws = protocols === undefined ? new Native(this.url) : new Native(this.url, protocols);
+      ws.binaryType = this._binaryType;
+      this._native = ws;
+      var opened = false;
+      function fallBack() {
+        clearTimeout(timer);
+        if (self._native !== ws) return;
+        self._native = null;
+        ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+        try { ws.close(); } catch (_) {}
+        if (self.readyState === 0) self._openHttp();
+      }
+      var timer = setTimeout(function () { if (!opened) fallBack(); }, NATIVE_OPEN_TIMEOUT_MS);
+      ws.onopen = function () {
+        opened = true;
+        clearTimeout(timer);
+        if (self.readyState !== 0) { try { ws.close(); } catch (_) {} return; }
+        self.protocol = ws.protocol;
+        self.extensions = ws.extensions;
+        self.readyState = 1;
+        self._emit('open');
+      };
+      ws.onmessage = function (event) { self._emit('message', { data: event.data }); };
+      // Before open an error is the cue to fall back, not something to show.
+      ws.onerror = function () { if (opened) self._emit('error'); };
+      ws.onclose = function (event) {
+        if (!opened) return fallBack();
+        self._native = null;
+        self.readyState = 3;
+        self._emit('close', { code: event.code, reason: event.reason, wasClean: event.wasClean });
+      };
+    }
+
+    _post(action, body) {
+      var url = this._base + action + (action === 'open' ? this._search : '?sid=' + encodeURIComponent(this._sid || ''));
+      return W.fetch(url, { method: 'POST', cache: 'no-store', body: body, keepalive: action === 'close' });
+    }
+
+    _openHttp() {
+      var self = this;
+      this._post('open').then(function (response) {
+        if (!response.ok) throw new Error('open ' + response.status);
+        return response.json();
+      }).then(function (info) {
+        if (self.readyState !== 0) { self._sid = info.sid; self._post('close').catch(function () {}); return; }
+        self._sid = info.sid;
+        preferHttp = true;
+        self.protocol = info.protocol || '';
+        self.readyState = 1;
+        self._emit('open');
+        self._poll();
+        self._flush();
+      }).catch(function () {
+        if (self.readyState === 3) return;
+        self.readyState = 3;
+        self._emit('error');
+        self._emit('close', { code: 1006, reason: '', wasClean: false });
+      });
+    }
+
+    _poll() {
+      var self = this;
+      if (this.readyState !== 1 || this._native) return;
+      this._post('recv').then(function (response) {
+        if (response.status === 410) return { closed: 1006 };
+        if (!response.ok) throw new Error('recv ' + response.status);
+        var closed = response.headers.get('x-freebuff-tty-closed');
+        return response.arrayBuffer().then(function (buffer) {
+          return { buffer: buffer, closed: closed === null ? null : Number(closed) || 1005 };
+        });
+      }).then(function (result) {
+        // Closed from this side while the poll was out: close() reports it.
+        if (self.readyState !== 1) return;
+        self._pollFailures = 0;
+        if (result.buffer) self._deliver(result.buffer);
+        if (result.closed !== null) return self._finish(result.closed);
+        self._poll();
+      }).catch(function () {
+        if (self.readyState !== 1) return;
+        if (++self._pollFailures >= 3) return self._finish(1006);
+        setTimeout(function () { self._poll(); }, 1000);
+      });
+    }
+
+    _deliver(buffer) {
+      var view = new DataView(buffer);
+      var off = 0;
+      while (off + 5 <= buffer.byteLength && this.readyState === 1) {
+        var type = view.getUint8(off);
+        var length = view.getUint32(off + 1);
+        var payload = buffer.slice(off + 5, off + 5 + length);
+        off += 5 + length;
+        var data =
+          type === 1 ? decoder.decode(payload) :
+          this._binaryType === 'arraybuffer' ? payload :
+          new Blob([payload]);
+        this._emit('message', { data: data });
+      }
+    }
+
+    _flush() {
+      var self = this;
+      if (this._sending || this._outbox.length === 0 || this.readyState !== 1) return;
+      var batch = this._outbox;
+      this._outbox = [];
+      this._sending = true;
+      this._post('send', encodeRecords(batch)).then(function (response) {
+        if (!response.ok) throw new Error('send ' + response.status);
+        self._sending = false;
+        self._flush();
+      }).catch(function () {
+        self._sending = false;
+        self._finish(1006);
+      });
+    }
+
+    _finish(code) {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this._emit('close', { code: code, reason: '', wasClean: code !== 1006 });
+    }
+
+    send(data) {
+      if (this.readyState === 0) throw new DOMException('Still in CONNECTING state.', 'InvalidStateError');
+      if (this._native) return this._native.send(data);
+      if (this.readyState !== 1) return;
+      var item = toBytes(data);
+      if (!item) { console.warn('[freebuff] terminal transport cannot send this data type'); return; }
+      this._outbox.push(item);
+      this._flush();
+    }
+
+    close(code, reason) {
+      if (this._native && this.readyState === 1) return this._native.close(code, reason);
+      if (this.readyState >= 2) return;
+      var wasOpen = this.readyState === 1;
+      this.readyState = 2;
+      if (this._native) {
+        // Closed while the real WebSocket was still connecting: drop it
+        // without letting its close start the fallback.
+        var ws = this._native;
+        this._native = null;
+        ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+        try { ws.close(); } catch (_) {}
+      } else if (wasOpen) {
+        this._post('close').catch(function () {});
+      }
+      var self = this;
+      setTimeout(function () { self._finish(code || 1005); }, 0);
+    }
+  }
+
+  var STATES = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+  for (var key in STATES) {
+    Object.defineProperty(FreebuffTtySocket, key, { value: STATES[key] });
+    Object.defineProperty(FreebuffTtySocket.prototype, key, { value: STATES[key] });
+  }
+  Object.defineProperty(FreebuffTtySocket, '__freebuffTty', { value: true });
+  W.WebSocket = FreebuffTtySocket;
+}`;String.raw`'use strict';
+// Freebuff hosted workspace gateway. Generated by
+// freebuff/web/codebase-utils/hosted-workspace-gateway.ts - edit it there.
+const http = require('http');
+const net = require('net');
+const fs = require('fs');
+const crypto = require('crypto');
+const zlib = require('zlib');
+const childProcess = require('child_process');
+
+const args = process.argv.slice(2);
+const sep = args.indexOf('--');
+if (sep < 4) { console.error('usage: gateway <service> <port> <socket> <tokenFile> -- <backend...>'); process.exit(64); }
+const service = args[0];
+const port = Number(args[1]);
+const socketPath = args[2];
+const tokenFile = args[3];
+const backend = args.slice(sep + 1);
+const token = fs.readFileSync(tokenFile, 'utf8').trim();
+if (!/^[0-9a-f]{64}$/.test(token) || !Number.isInteger(port) || backend.length === 0) {
+  console.error('[gateway] invalid configuration');
+  process.exit(64);
+}
+const tokenBuf = Buffer.from(token);
+const prefix = '/' + token;
+
+function tokenMatches(candidate) {
+  const buf = Buffer.from(String(candidate));
+  return buf.length === tokenBuf.length && crypto.timingSafeEqual(buf, tokenBuf);
+}
+
+// Returns { target } for an authorised URL, { redirect } for one that only
+// needs normalising, or null.
+function route(rawUrl) {
+  const url = String(rawUrl || '');
+  const q = url.indexOf('?');
+  const pathname = q < 0 ? url : url.slice(0, q);
+  const search = q < 0 ? '' : url.slice(q);
+  if (pathname.charAt(0) !== '/') return null;
+  const segmentEnd = pathname.indexOf('/', 1);
+  const segment = segmentEnd < 0 ? pathname.slice(1) : pathname.slice(1, segmentEnd);
+  if (tokenMatches(segment)) {
+    if (segmentEnd < 0) return { redirect: prefix + '/' + search };
+    return { target: pathname.slice(segmentEnd) + search };
+  }
+  // A client from before the path form sends ?tkn=<token> at the root. Move
+  // it into the path once; the redirect drops the query parameter.
+  if (pathname === '/' && search) {
+    const params = new URLSearchParams(search.slice(1));
+    const legacy = params.get('tkn');
+    if (legacy !== null && tokenMatches(legacy)) {
+      params.delete('tkn');
+      const rest = params.toString();
+      return { redirect: prefix + '/' + (rest ? '?' + rest : '') };
+    }
+  }
+  return null;
+}
+
+function forwardHeaders(rawHeaders) {
+  const out = [];
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    if (rawHeaders[i].toLowerCase() === 'x-forwarded-prefix') continue;
+    out.push(rawHeaders[i], rawHeaders[i + 1]);
+  }
+  out.push('X-Forwarded-Prefix', prefix);
+  return out;
+}
+
+function notFound(res) {
+  res.writeHead(404, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+  res.end('Not found');
+}
+
+function noStore(extra) {
+  return Object.assign({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }, extra || {});
+}
+
+// --- Terminal HTTP transport -------------------------------------------------
+// The same ttyd session the WebSocket carries, over plain requests, for a
+// browser whose WebSocket upgrade never reaches us (see
+// HOSTED_TERMINAL_TRANSPORT_SHIM_SOURCE). The gateway is the WebSocket client
+// to ttyd here, over the UNIX socket.
+const TTY_PATH = '${"/__freebuff_tty/"}';
+const TTY_SHIM = ${JSON.stringify(t)};
+const TTY_MAX_SESSIONS = 32;
+const TTY_POLL_MS = 25000;
+const TTY_IDLE_MS = 60000;
+const TTY_HIGH_WATER = 4 * 1024 * 1024;
+const TTY_MAX_SEND = 1024 * 1024;
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const ttySessions = new Map();
+
+// Client-to-server frames must be masked (RFC 6455 5.3).
+function wsFrame(opcode, payload) {
+  const len = payload.length;
+  const head = Buffer.alloc(len < 126 ? 2 : len < 65536 ? 4 : 10);
+  head[0] = 0x80 | opcode;
+  if (len < 126) head[1] = 0x80 | len;
+  else if (len < 65536) { head[1] = 0x80 | 126; head.writeUInt16BE(len, 2); }
+  else { head[1] = 0x80 | 127; head.writeBigUInt64BE(BigInt(len), 2); }
+  const mask = crypto.randomBytes(4);
+  const body = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) body[i] = payload[i] ^ mask[i & 3];
+  return Buffer.concat([head, mask, body]);
+}
+
+function ttyWrite(s, opcode, payload) {
+  if (s.closed === null && !s.sock.destroyed) s.sock.write(wsFrame(opcode, payload));
+}
+
+function ttyRespond(s) {
+  const waiter = s.waiter;
+  if (!waiter) return;
+  s.waiter = null;
+  clearTimeout(waiter.timer);
+  const body = Buffer.concat(s.queue);
+  s.queue = [];
+  s.queued = 0;
+  if (!s.sock.destroyed) s.sock.resume();
+  const headers = noStore({ 'Content-Type': 'application/octet-stream', 'Content-Length': body.length });
+  if (s.closed !== null) {
+    headers['X-Freebuff-Tty-Closed'] = String(s.closed);
+    ttySessions.delete(s.id);
+  }
+  waiter.res.writeHead(200, headers);
+  waiter.res.end(body);
+}
+
+function ttyWake(s) {
+  if (s.waiter && !s.waiter.scheduled) {
+    s.waiter.scheduled = true;
+    // Let the frames that arrived in the same read join this response.
+    setImmediate(() => ttyRespond(s));
+  }
+}
+
+function ttyPush(s, type, payload) {
+  const record = Buffer.alloc(5 + payload.length);
+  record[0] = type;
+  record.writeUInt32BE(payload.length, 1);
+  payload.copy(record, 5);
+  s.queue.push(record);
+  s.queued += record.length;
+  // Nobody is reading: stop reading ttyd rather than buffer without bound.
+  if (s.queued > TTY_HIGH_WATER) s.sock.pause();
+  ttyWake(s);
+}
+
+function ttyClosed(s, code) {
+  if (s.closed !== null) return;
+  s.closed = code;
+  // end(), not destroy(): a close frame just written must still reach ttyd,
+  // which is what makes it hang up the shell.
+  s.sock.end();
+  setTimeout(() => s.sock.destroy(), 1000).unref();
+  ttyWake(s);
+}
+
+function ttyParse(s) {
+  for (;;) {
+    const b = s.buf;
+    if (b.length < 2) return;
+    const fin = (b[0] & 0x80) !== 0;
+    const opcode = b[0] & 0x0f;
+    const masked = (b[1] & 0x80) !== 0;
+    let len = b[1] & 0x7f;
+    let off = 2;
+    if (len === 126) { if (b.length < 4) return; len = b.readUInt16BE(2); off = 4; }
+    else if (len === 127) { if (b.length < 10) return; len = Number(b.readBigUInt64BE(2)); off = 10; }
+    if (masked) off += 4;
+    if (b.length < off + len) return;
+    const payload = Buffer.from(b.subarray(off, off + len));
+    if (masked) for (let i = 0; i < len; i++) payload[i] ^= b[off - 4 + (i & 3)];
+    s.buf = b.subarray(off + len);
+    if (opcode === 8) {
+      if (s.closed === null && !s.sock.destroyed) s.sock.write(wsFrame(8, payload.subarray(0, 2)));
+      return ttyClosed(s, payload.length >= 2 ? payload.readUInt16BE(0) : 1005);
+    }
+    if (opcode === 9) { ttyWrite(s, 10, payload); continue; }
+    if (opcode === 10) continue;
+    if (opcode === 0 && s.frag) {
+      s.frag.push(payload);
+      if (fin) { const whole = Buffer.concat(s.frag); s.frag = null; ttyPush(s, s.fragType, whole); }
+      continue;
+    }
+    if (opcode === 1 || opcode === 2) {
+      if (fin) ttyPush(s, opcode, payload);
+      else { s.frag = [payload]; s.fragType = opcode; }
+      continue;
+    }
+    return ttyClosed(s, 1002);
+  }
+}
+
+function ttyOpen(wsTarget, done) {
+  if (ttySessions.size >= TTY_MAX_SESSIONS) return done(503);
+  const key = crypto.randomBytes(16).toString('base64');
+  const expectedAccept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+  const s = { id: crypto.randomBytes(16).toString('hex'), sock: null, buf: Buffer.alloc(0), queue: [], queued: 0, waiter: null, closed: null, frag: null, fragType: 0, seen: Date.now(), protocol: '' };
+  let settled = false;
+  let upgraded = false;
+  const settle = (status) => { if (!settled) { settled = true; done(status, s); } };
+  const sock = net.connect(socketPath);
+  s.sock = sock;
+  sock.on('connect', () => {
+    sock.write(['GET ' + wsTarget + ' HTTP/1.1', 'Host: localhost', 'Upgrade: websocket', 'Connection: Upgrade', 'Sec-WebSocket-Version: 13', 'Sec-WebSocket-Key: ' + key, 'Sec-WebSocket-Protocol: tty'].join('\r\n') + '\r\n\r\n');
+  });
+  sock.on('data', (chunk) => {
+    s.buf = s.buf.length ? Buffer.concat([s.buf, chunk]) : chunk;
+    if (!upgraded) {
+      const end = s.buf.indexOf('\r\n\r\n');
+      if (end < 0) { if (s.buf.length > 16384) sock.destroy(); return; }
+      const lines = s.buf.subarray(0, end).toString('latin1').split('\r\n');
+      s.buf = s.buf.subarray(end + 4);
+      let accept = null;
+      for (let i = 1; i < lines.length; i++) {
+        const colon = lines[i].indexOf(':');
+        if (colon < 0) continue;
+        const name = lines[i].slice(0, colon).trim().toLowerCase();
+        const value = lines[i].slice(colon + 1).trim();
+        if (name === 'sec-websocket-accept') accept = value;
+        if (name === 'sec-websocket-protocol') s.protocol = value;
+      }
+      if (!/^HTTP\/1\.1 101 /.test(lines[0]) || accept !== expectedAccept) { sock.destroy(); return settle(502); }
+      upgraded = true;
+      ttySessions.set(s.id, s);
+      settle(200);
+    }
+    ttyParse(s);
+  });
+  sock.on('error', () => {});
+  sock.on('close', () => { if (!upgraded) settle(502); else ttyClosed(s, 1006); });
+}
+
+function readBody(req, limit, done) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (chunk) => {
+    size += chunk.length;
+    if (size > limit) { req.destroy(); return; }
+    chunks.push(chunk);
+  });
+  req.on('end', () => done(Buffer.concat(chunks)));
+}
+
+function handleTty(req, res, target) {
+  const q = target.indexOf('?');
+  const action = (q < 0 ? target : target.slice(0, q)).slice(TTY_PATH.length);
+  const search = q < 0 ? '' : target.slice(q);
+  if (req.method !== 'POST') { res.writeHead(405, noStore({ Allow: 'POST' })); return res.end(); }
+  if (action !== 'send') req.resume();
+  if (action === 'open') {
+    return ttyOpen('/ws' + search, (status, s) => {
+      if (status !== 200) { res.writeHead(status, noStore()); return res.end(); }
+      res.writeHead(200, noStore({ 'Content-Type': 'application/json' }));
+      res.end(JSON.stringify({ sid: s.id, protocol: s.protocol }));
+    });
+  }
+  const s = ttySessions.get(new URLSearchParams(search.slice(1)).get('sid') || '');
+  if (!s) { res.writeHead(410, noStore()); return res.end(); }
+  s.seen = Date.now();
+  if (action === 'recv') {
+    if (s.waiter) {
+      // A second poll means the first was abandoned; release it empty.
+      const old = s.waiter;
+      s.waiter = null;
+      clearTimeout(old.timer);
+      old.res.writeHead(200, noStore({ 'Content-Length': 0 }));
+      old.res.end();
+    }
+    const waiter = { res, timer: null, scheduled: false };
+    s.waiter = waiter;
+    waiter.timer = setTimeout(() => ttyRespond(s), TTY_POLL_MS);
+    res.on('close', () => {
+      if (s.waiter === waiter) { s.waiter = null; clearTimeout(waiter.timer); }
+      s.seen = Date.now();
+    });
+    if (s.queue.length || s.closed !== null) ttyWake(s);
+    return;
+  }
+  if (action === 'send') {
+    return readBody(req, TTY_MAX_SEND, (body) => {
+      if (s.closed !== null) { res.writeHead(410, noStore()); return res.end(); }
+      let off = 0;
+      while (off + 5 <= body.length) {
+        const type = body[off];
+        const len = body.readUInt32BE(off + 1);
+        if (off + 5 + len > body.length) break;
+        ttyWrite(s, type === 1 ? 1 : 2, body.subarray(off + 5, off + 5 + len));
+        off += 5 + len;
+      }
+      res.writeHead(204, noStore());
+      res.end();
+    });
+  }
+  if (action === 'close') {
+    ttyWrite(s, 8, Buffer.from([0x03, 0xe8]));
+    ttyClosed(s, 1000);
+    ttySessions.delete(s.id);
+    res.writeHead(204, noStore());
+    return res.end();
+  }
+  res.writeHead(404, noStore());
+  res.end();
+}
+
+// A tab that closed without saying so: its poll stops arriving.
+setInterval(() => {
+  const now = Date.now();
+  for (const s of ttySessions.values()) {
+    if (!s.waiter && now - s.seen > TTY_IDLE_MS) { ttyClosed(s, 1001); ttySessions.delete(s.id); }
+  }
+}, 15000).unref();
+
+// ttyd's page, with the transport shim ahead of ttyd's own bundle. Asked for
+// uncompressed, and decompressed anyway if ttyd gzips regardless.
+function serveTerminalIndex(req, res, target) {
+  const headers = [];
+  const raw = forwardHeaders(req.rawHeaders);
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    if (raw[i].toLowerCase() !== 'accept-encoding') headers.push(raw[i], raw[i + 1]);
+  }
+  const upstream = http.request({ socketPath, method: 'GET', path: target, headers }, (upRes) => {
+    const chunks = [];
+    upRes.on('data', (chunk) => chunks.push(chunk));
+    upRes.on('end', () => {
+      let body = Buffer.concat(chunks);
+      const out = Object.assign({}, upRes.headers);
+      out['referrer-policy'] = 'no-referrer';
+      if (upRes.statusCode === 200 && /text\/html/i.test(String(upRes.headers['content-type'] || ''))) {
+        try {
+          if (/gzip/i.test(String(upRes.headers['content-encoding'] || ''))) body = zlib.gunzipSync(body);
+          let html = body.toString('utf8');
+          const tag = '<script>(' + TTY_SHIM + ')(window);</script>';
+          const head = /<head[^>]*>/i.exec(html);
+          html = head ? html.slice(0, head.index + head[0].length) + tag + html.slice(head.index + head[0].length) : tag + html;
+          body = Buffer.from(html, 'utf8');
+          delete out['content-encoding'];
+          out['cache-control'] = 'no-store';
+        } catch (_) {}
+      }
+      out['content-length'] = String(body.length);
+      delete out['transfer-encoding'];
+      res.writeHead(upRes.statusCode || 502, out);
+      res.end(body);
+    });
+    upRes.on('error', () => res.destroy());
+  });
+  upstream.on('error', () => {
+    if (!res.headersSent) { res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('Bad gateway'); }
+    else res.destroy();
+  });
+  upstream.end();
+}
+
+const server = http.createServer((req, res) => {
+  const routed = route(req.url);
+  if (!routed) return notFound(res);
+  if (routed.redirect) {
+    res.writeHead(302, { Location: routed.redirect, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+    return res.end();
+  }
+  if (service === 'terminal') {
+    const q = routed.target.indexOf('?');
+    const targetPath = q < 0 ? routed.target : routed.target.slice(0, q);
+    if (targetPath.indexOf(TTY_PATH) === 0) return handleTty(req, res, routed.target);
+    if (targetPath === '/' && req.method === 'GET') return serveTerminalIndex(req, res, routed.target);
+  }
+  const upstream = http.request({ socketPath, method: req.method, path: routed.target, headers: forwardHeaders(req.rawHeaders) }, (upRes) => {
+    const headers = Object.assign({}, upRes.headers);
+    // The page URL carries the token; never let it leave in a Referer.
+    headers['referrer-policy'] = 'no-referrer';
+    res.writeHead(upRes.statusCode || 502, headers);
+    upRes.pipe(res);
+  });
+  upstream.on('error', () => {
+    if (!res.headersSent) { res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('Bad gateway'); }
+    else res.destroy();
+  });
+  req.pipe(upstream);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  socket.on('error', () => socket.destroy());
+  const routed = route(req.url);
+  if (!routed || !routed.target) {
+    socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  const upstream = net.connect(socketPath, () => {
+    const headers = forwardHeaders(req.rawHeaders);
+    const lines = [req.method + ' ' + routed.target + ' HTTP/' + req.httpVersion];
+    for (let i = 0; i + 1 < headers.length; i += 2) lines.push(headers[i] + ': ' + headers[i + 1]);
+    upstream.write(lines.join('\r\n') + '\r\n\r\n');
+    if (head && head.length) upstream.write(head);
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+  upstream.on('error', () => socket.destroy());
+  socket.on('close', () => upstream.destroy());
+});
+
+server.on('clientError', (_err, socket) => { try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (_) {} });
+// Long-lived editor/terminal traffic: no whole-request deadline.
+server.requestTimeout = 0;
+server.keepAliveTimeout = 65000;
+
+try { fs.unlinkSync(socketPath); } catch (_) {}
+const child = childProcess.spawn(backend[0], backend.slice(1), { stdio: ['ignore', 'inherit', 'inherit'], env: process.env });
+try { fs.writeFileSync(socketPath + '.pid', String(child.pid), { mode: 0o600 }); } catch (_) {}
+let stopping = false;
+function stop(code) {
+  if (stopping) return;
+  stopping = true;
+  try { child.kill('SIGTERM'); } catch (_) {}
+  server.close();
+  setTimeout(() => process.exit(code), 200).unref();
+}
+child.on('exit', (code) => { if (!stopping) { console.error('[gateway] ' + service + ' backend exited with ' + code); stop(1); } });
+child.on('error', (err) => { console.error('[gateway] ' + service + ' backend failed to start: ' + err.message); stop(1); });
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => stop(0));
+
+server.on('error', (err) => { console.error('[gateway] listen failed: ' + err.code); stop(1); });
+server.listen(port, '0.0.0.0');
+`;let r="/home/daytona/codebase",s={code:2e4,terminal:25e3};function n(e,t){return"number"==typeof t&&Number.isInteger(t)&&t>=s[e]&&t<s[e]+4e3}e.s(["C",0,r,"D",0,43867,"A",0,7681,"x",0,function(e,t){if(!e||!("string"==typeof t&&RegExp("^[0-9a-f]{64}$").test(t)))return e;let r=new URL(e),s=r.pathname.replace(/^\/+/,"");return r.pathname=`/${t}/${s}`,r.toString()},"_",0,function(e){let t=e.replace(/[^A-Za-z0-9_-]/g,"");if(!t)throw Error("Invalid thread workspace id.");return`/home/daytona/worktrees/${t}`},"l",0,function(e,t,o,a){if(!t.startsWith("/home/daytona/worktrees/"))return function(e,t=r){if(t===r)return"code"===e?43867:7681;let n=0;for(let e of t)n=31*n+e.charCodeAt(0)>>>0;return s[e]+n%4e3}(e,t);if(n(e,a))return a;let i=o?.[e];return n(e,i)?i:null}],802879)},881797,e=>{var t=e.i(843476),r=e.i(271645);e.s(["f",0,function({className:e=""}){let[s,n]=(0,r.useState)(0);return(0,r.useEffect)(()=>{let e=performance.now(),t=setInterval(()=>{n(98*(1-Math.exp(-((performance.now()-e)/1e3)/12)))},150);return()=>clearInterval(t)},[]),(0,t.jsxs)("div",{className:`flex w-56 flex-col items-center gap-2 ${e}`,children:[(0,t.jsx)("div",{className:"h-1 w-full overflow-hidden rounded-full bg-muted",children:(0,t.jsx)("div",{className:"h-full rounded-full bg-brand transition-[width] duration-200 ease-linear",style:{width:`${s}%`}})}),(0,t.jsxs)("span",{className:"text-[11px] tabular-nums text-muted-foreground",children:[Math.floor(s),"%"]})]})}])},398520,e=>{var t=e.i(843476),r=e.i(951445),s=e.i(826707),n=e.i(158913);let o=[{value:"desktop",label:"Desktop",Icon:r.f},{value:"mobile",label:"Mobile",Icon:s.f}];e.s(["f",0,function({value:e,onChange:r,disabled:s=!1,className:a}){return(0,t.jsx)("div",{role:"tablist","aria-label":"Preview viewport",className:(0,n.c)("fb-tabs hidden shrink-0 items-center lg:flex",a),children:o.map(({value:n,label:o,Icon:a})=>{let i=e===n;return(0,t.jsx)("button",{type:"button","aria-label":`${o} preview`,role:"tab","aria-selected":i,title:`${o} preview`,disabled:s,onClick:()=>r(n),className:"fb-tab flex w-7 items-center justify-center px-0 disabled:cursor-not-allowed disabled:opacity-40",children:(0,t.jsx)(a,{className:"size-3.5",strokeWidth:1.75,"aria-hidden":"true"})},n)})})}])},864592,e=>{var t=e.i(843476);e.i(583765);var r=e.i(863478),s=e.i(198126),n=e.i(360896),o=e.i(601835),a=e.i(91733),i=e.i(314811),l=e.i(123574),c=e.i(878894),d=e.i(267922),d=d,u=e.i(966992),f=e.i(248256),h=e.i(352786),p=e.i(714125),m=e.i(16715),g=e.i(271645),y=e.i(846696),b=e.i(158913);function w(e){return null===e?"fb-meter--grad":e>=90?"fb-meter--danger":e>=60?"fb-meter--warning":"fb-meter--grad"}function x({label:e,percent:r,barColor:s}){return(0,t.jsxs)("div",{className:"space-y-1",children:[(0,t.jsxs)("div",{className:"flex items-center justify-between",children:[(0,t.jsx)("span",{className:"text-xs font-medium text-muted-foreground",children:e}),(0,t.jsx)("span",{className:"text-xs font-semibold tabular-nums",children:null!==r?`${r.toFixed(0)}%`:"—"})]}),(0,t.jsx)("div",{className:`fb-meter h-1.5 w-full ${s}`,children:(0,t.jsx)("div",{className:"fb-meter__fill",style:{width:`${Math.min(r??0,100)}%`}})})]})}function v({upgrading:e,disabled:s,onClick:n}){return(0,t.jsxs)("button",{type:"button",onClick:n,disabled:s,className:"fb-btn fb-btn--primary fb-btn--md w-full gap-1.5",children:[e?(0,t.jsx)(r.U,{className:"h-3.5 w-3.5"}):(0,t.jsx)(d.f,{className:"h-3.5 w-3.5"}),"Increase storage to 8 GB"]})}function k({icon:e,label:r,value:s}){return(0,t.jsxs)("div",{className:"flex flex-col items-center gap-0.5 rounded-md border border-border bg-canvas py-1.5",children:[(0,t.jsx)("span",{className:"text-muted-foreground",children:e}),(0,t.jsx)("span",{className:"text-xs font-semibold tabular-nums",children:s}),(0,t.jsx)("span",{className:"text-[10px] text-muted-foreground",children:r})]})}e.s(["f",0,function({projectId:e,sandboxSize:d,vmSpecs:S,vmHealth:_,storageUpgradeState:T,statusLabel:N,dotClassName:j,pingClassName:E,connectionErrorMessage:C,onRequestStatusRefresh:R,triggerClassName:q,triggerLabel:I,isBrowserRuntime:P=!1}){let[B,M]=(0,g.useState)(!1),[O,F]=(0,g.useState)(!1),H=(0,l.J)(s.f.monitoring.getSandboxStats),A=(0,l.J)(s.f.cloud.storage.upgradeSandboxStorage),L=(0,l.G)(s.f.cloud.storage.getStorageUpgradeAvailability,B&&e&&!P?{projectId:e}:"skip"),U=L?.available===!0,W=O||"migrating"===T||L?.available===!1&&"in_progress"===L.reason,$=(0,i.f)({queryKey:["vmStatusStats",e],queryFn:async()=>{if(!e)throw Error("No project ID");return await H({projectId:e})},enabled:B&&!!e&&!P,refetchInterval:15e3,retry:1}),D=(0,i.f)({queryKey:["vmHealthRealtime",e],queryFn:()=>(0,o.z)(e),enabled:!!e&&!P,staleTime:6e4,refetchInterval:3e5,refetchOnWindowFocus:!1,retry:!1}),G=(0,o.Q)(_,D.data),V=$.data,z=V?.disk,K=V?.cpu,Y=V?.memory,J=(0,o._)({vm_specs:S,sandbox_size:d}),X="number"==typeof Y?.limit_bytes?Y.limit_bytes/0x40000000:null,Q=J.approximate&&!V,Z=$.isFetching?"…":"—",ee=K?.limit_cores?`${Math.round(K.limit_cores)}`:Q?Z:`${J.vcpu}`,et=null!==X?`${Math.round(X)} GB`:Q?Z:`${J.ramGb} GB`,er=z?.size_bytes?`${Math.round(z.size_bytes/0x40000000)} GB`:Q?Z:`${J.diskGb} GB`,es=null!==X?(0,o.m)(X):Q?$.isFetching?"Reading…":"Unknown":J.sizeLabel,en=V?null:G,eo=z?.usage_percent??en?.disk_percent??null,ea=Y?.usage_percent??en?.memory_percent??null,ei=K?.usage_percent??en?.cpu_percent??null,el=null!==en&&Date.now()-en.at>6e5,ec=z?`${(0,a.L)(z.used_bytes)} / ${(0,a.L)(z.size_bytes)}`:en?el?`Last checked ${function(e){let t=Math.max(1,Math.round((Date.now()-e)/6e4));if(t<60)return`${t}m ago`;let r=Math.round(t/60);return r<48?`${r}h ago`:`${Math.round(r/24)}d ago`}(en.at)}`:"From the latest agent run":$.isFetching?"Reading usage…":$.isError?"Usage unavailable (VM may be asleep)":"Usage unavailable",ed=null!==eo&&eo>=80,eu=null!==ea&&ea>=90,ef=null!==eo&&eo>=90||eu,eh=C?.trim()||null,ep=function(e){if(!e)return!1;let t=e.toLowerCase();return t.includes("no space left")||t.includes("enospc")||t.includes("disk full")||t.includes("out of disk")||t.includes("disk quota")||t.includes("no space")||t.includes("disk")&&t.includes("full")}(eh),em=async()=>{if(e&&!O)try{F(!0),await A({projectId:e}),y.c.success("VM storage upgraded to 8 GB. The computer has restarted."),M(!1)}catch(e){y.c.error(e instanceof Error?e.message:"Could not upgrade VM storage")}finally{F(!1)}};return(0,t.jsxs)(n.Popover,{open:B,onOpenChange:t=>{M(t),t&&(R?.(),e&&!P&&D.refetch())},children:[(0,t.jsx)(n.PopoverTrigger,{asChild:!0,children:(0,t.jsxs)("button",{type:"button","aria-label":P?`Browser runtime: ${N}`:`Virtual machine: ${N}`,className:(0,b.c)("fb-btn fb-btn--ghost fb-btn--icon fb-btn--sm relative",q),children:[E&&(0,t.jsx)("span",{className:`absolute h-2.5 w-2.5 rounded-full ${E} animate-ping`}),(0,t.jsx)("span",{className:`relative h-2.5 w-2.5 rounded-full ${j}`}),I&&(0,t.jsx)("span",{className:"truncate",children:I}),!P&&(ef||ep)&&(0,t.jsx)(c.f,{className:"absolute -right-0.5 -top-0.5 h-3 w-3 fill-background text-destructive-text"})]})}),(0,t.jsxs)(n.PopoverContent,{align:"end",sideOffset:8,className:"w-72 p-0",children:[(0,t.jsxs)("div",{className:"flex items-center justify-between gap-2 border-b border-border px-3 py-2.5",children:[(0,t.jsxs)("div",{className:"flex items-center gap-2",children:[(0,t.jsx)("span",{className:`h-2 w-2 rounded-full ${j}`}),(0,t.jsx)("span",{className:"text-sm font-semibold",children:P?"Browser runtime":"Virtual machine"})]}),(0,t.jsxs)("div",{className:"flex items-center gap-1",children:[(0,t.jsx)("span",{className:"text-xs text-muted-foreground",children:$.isFetching?"Checking…":N}),(0,t.jsx)("button",{type:"button","aria-label":"Refresh VM status",onClick:()=>{$.refetch(),R?.()},disabled:$.isFetching,className:"fb-btn fb-btn--ghost fb-btn--icon fb-btn--xs",children:$.isFetching?(0,t.jsx)(r.U,{className:"h-3.5 w-3.5"}):(0,t.jsx)(m.f,{className:"h-3.5 w-3.5"})})]})]}),(0,t.jsxs)("div",{className:"space-y-3 p-3",children:[P?(0,t.jsx)("p",{className:"text-[11px] leading-snug text-muted-foreground",children:"Running in your browser — no remote VM resources to show."}):(0,t.jsxs)(t.Fragment,{children:[(0,t.jsxs)("div",{children:[(0,t.jsxs)("div",{className:"mb-1.5 flex items-center justify-between",children:[(0,t.jsx)("span",{className:"text-xs font-medium text-muted-foreground",children:"Size"}),(0,t.jsx)("span",{className:"text-xs font-semibold",children:es})]}),(0,t.jsxs)("div",{className:"grid grid-cols-3 gap-2",children:[(0,t.jsx)(k,{icon:(0,t.jsx)(u.f,{className:"h-3.5 w-3.5"}),label:"vCPU",value:ee}),(0,t.jsx)(k,{icon:(0,t.jsx)(p.f,{className:"h-3.5 w-3.5"}),label:"RAM",value:et}),(0,t.jsx)(k,{icon:(0,t.jsx)(h.f,{className:"h-3.5 w-3.5"}),label:"Disk",value:er})]}),void 0!==J.limitedRegion&&(0,t.jsxs)("div",{className:"mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground",children:[(0,t.jsx)(f.f,{className:"h-3 w-3"}),J.limitedRegion?"Limited region — smaller VM tier":"Standard region"]})]}),(0,t.jsxs)("div",{className:"space-y-2",children:[(0,t.jsx)(x,{label:"Storage",percent:eo,barColor:w(eo)}),(0,t.jsx)(x,{label:"Memory",percent:ea,barColor:w(ea)}),(0,t.jsx)(x,{label:"CPU",percent:ei,barColor:w(ei)}),(0,t.jsx)("div",{className:"text-[11px] text-muted-foreground",children:ec})]})]}),W&&(0,t.jsxs)("div",{className:"flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2.5",children:[(0,t.jsx)(r.U,{className:"mt-0.5 h-3.5 w-3.5 shrink-0 text-warning"}),(0,t.jsx)("p",{className:"text-[11px] leading-snug text-foreground/90",children:"Transferring this workspace to the 8 GB disk. The VM will restart when the transfer finishes."})]}),U&&!W&&!ed&&!eh&&(0,t.jsx)(v,{upgrading:O,disabled:O||!e,onClick:em}),eh&&(0,t.jsxs)("div",{className:"space-y-2 rounded-md border border-destructive/40 bg-destructive/10 p-2.5",children:[(0,t.jsxs)("div",{className:"flex items-start gap-2",children:[(0,t.jsx)(c.f,{className:"mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive-text"}),(0,t.jsxs)("div",{className:"min-w-0 space-y-1",children:[(0,t.jsx)("p",{className:"text-[11px] font-semibold text-foreground",children:ep?"VM ran out of storage":"VM connection error"}),(0,t.jsx)("p",{className:"max-h-24 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-snug text-muted-foreground",children:eh})]})]}),ep&&U&&(0,t.jsx)(v,{upgrading:O,disabled:O||!e,onClick:em})]}),!P&&!eh&&eu&&(0,t.jsxs)("div",{className:"flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2.5",children:[(0,t.jsx)(c.f,{className:"mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive-text"}),(0,t.jsx)("p",{className:"text-[11px] leading-snug text-foreground/90",children:"Memory is nearly exhausted. Builds and dev servers may be killed. Stop unused processes or restart the preview."})]}),!P&&!eh&&ed&&(0,t.jsxs)("div",{className:"space-y-2 rounded-md border border-warning/40 bg-warning/10 p-2.5",children:[(0,t.jsxs)("div",{className:"flex items-start gap-2",children:[(0,t.jsx)(c.f,{className:"mt-0.5 h-3.5 w-3.5 shrink-0 text-warning"}),(0,t.jsxs)("p",{className:"text-[11px] leading-snug text-foreground/90",children:["Storage is almost full. Large installs can crash the VM and stop it from starting."," ",U?"Increase storage to keep building.":"Free up space to keep building."]})]}),U&&(0,t.jsx)(v,{upgrading:O,disabled:O||!e,onClick:em})]})]})]})]})}],864592)},888651,e=>{var t=e.i(843476),r=e.i(878894),s=e.i(991810),n=e.i(881797),o=e.i(936325);e.s(["x",0,function({service:e,error:n,canRetry:o=!0,onRetry:a}){return(0,t.jsxs)("div",{className:"absolute inset-0 flex flex-col items-center justify-center gap-5 bg-background p-6 text-center",children:[(0,t.jsx)("div",{className:"flex h-14 w-14 items-center justify-center rounded-md border border-destructive/30 bg-destructive/10",children:(0,t.jsx)(r.f,{className:"h-6 w-6 text-destructive-text"})}),(0,t.jsxs)("div",{className:"max-w-md",children:[(0,t.jsxs)("p",{className:"text-sm font-semibold text-foreground",children:["Couldn't open ","code"===e?"VS Code":"the terminal"]}),(0,t.jsx)("p",{className:"mx-auto mt-1 break-words text-xs text-muted-foreground",children:n??"The sandbox did not come up in time. It may still be restoring."})]}),o&&(0,t.jsxs)("button",{type:"button",onClick:a,className:"fb-btn fb-btn--secondary fb-shine",children:[(0,t.jsx)(s.f,{className:"h-4 w-4"}),"Try again"]})]})},"P",0,function({service:e,elapsedSeconds:r}){let{title:s,subtitle:a}=(0,o.a)(e,r);return(0,t.jsxs)("div",{className:"absolute inset-0 flex flex-col items-center justify-center gap-5 bg-background p-6 text-center",children:[(0,t.jsxs)("div",{className:"max-w-sm",children:[(0,t.jsx)("p",{className:"text-sm font-semibold text-foreground",children:s}),(0,t.jsx)("p",{className:"mx-auto mt-1 text-xs text-muted-foreground",children:a})]}),(0,t.jsx)(n.f,{})]})}])},936325,e=>{var t=e.i(18338),r=e.i(198126),s=e.i(123574);e.i(790798);var n=e.i(803697),o=e.i(271645),a=e.i(239762);e.s(["L",0,function({enabled:e,semanticIdentifier:i,service:l,threadId:c,runtimeSurface:d="cloud"}){let u=(0,s.J)(t.f.cloud.preview.ensureWorkspaceService),f=(0,s.J)(r.f.codesandbox.management.ensureWorkspaceService),h="web"===d?f:u,[p,m]=(0,o.useState)("idle"),[g,y]=(0,o.useState)(null),[b,w]=(0,o.useState)(!0),[x,v]=(0,o.useState)(null),[k,S]=(0,o.useState)(null),[_,T]=(0,o.useState)(null),[N,j]=(0,o.useState)(0),[E,C]=(0,o.useState)(0),R=(0,o.useRef)(0),q=(0,o.useRef)("idle");q.current=p;let I=(0,o.useRef)(null);I.current=x;let P=(0,o.useRef)(null),B=(0,o.useRef)(!1),M=(0,o.useRef)({ensureWorkspaceService:h,semanticIdentifier:i,service:l,threadId:c,runtimeSurface:d});M.current={ensureWorkspaceService:h,semanticIdentifier:i,service:l,threadId:c,runtimeSurface:d},(0,o.useEffect)(()=>{if(!e||!l||!i){m("idle"),y(null),w(!0),v(null),S(null),T(null),j(0);return}let t=!1,r=++R.current;m("waking"),y(null),w(!0),v(null),S(null),T(null),j(0);let s=Date.now(),o=window.setInterval(()=>{j(Math.floor((Date.now()-s)/1e3))},1e3),u=async e=>{try{let s=await h("cloud"===d?{semanticIdentifier:i,service:l,threadId:c}:{semanticIdentifier:i,service:l});if(t||r!==R.current)return;v(s.connectionToken??null);let n=s.port;S("number"==typeof n?n:null);let o=s.url;if(T("string"==typeof o?o:null),s.ready){P.current=Date.now(),m("ready");return}if(e>0)return void window.setTimeout(()=>void u(e-1),3e3);m("error"),y(s.message),w(!0)}catch(o){if(t||r!==R.current)return;let s=function(e){let t=e instanceof n.f?"string"==typeof e.data?e.data:String(e.message??e.data):e instanceof Error?e.message:"string"==typeof e?e:"Failed to open the workspace",r=t.toLowerCase();if(r.includes("workspace_root_missing")||r.includes("has not been prepared yet"))return{message:"This thread’s workspace has not been prepared yet. Wait a moment and reopen the tab.",retryable:!0};if(r.includes("port_collision")||r.includes("workspace port"))return{message:"Another workspace is using this workspace port. Close the other thread’s Code or Terminal tab, then reopen this one.",retryable:!1};if(r.includes("repository remote does not match"))return{message:"This workspace points to a different GitHub repository. Reconnect the project before opening this workspace.",retryable:!1};if(r.includes("not authenticated"))return{message:"Your session has expired. Sign in again, then reopen the workspace.",retryable:!1};if(r.includes("project not found or access denied")||r.includes("thread does not belong to this project"))return{message:"This project or thread is no longer available to your account.",retryable:!1};if(t===a.e||r.includes("retrying will not help"))return{message:t.slice(0,500),retryable:!1};if(r.includes("sandbox not found")||r.includes("not found on the current daytona server"))return{message:"This cloud computer is no longer available. Reconnect the repository to create a new workspace.",retryable:!1};if(r.includes("ran out of storage")||r.includes("disk pressure"))return{message:"This cloud computer is out of storage. Free up space or increase its storage before retrying.",retryable:!1};let s=t.replace(/\[CONVEX[^\]]*\]\s*/gi,"").replace(/\[Request ID:[^\]]*\]\s*/gi,"").replace(/\s*Called by client\b.*$/is,"").replace(/^Server Error\s*/i,"").replace(/^(?:Uncaught Error:\s*)+/i,"").replace(/^ERROR RUNNING COMMAND:\s*/i,"").split(/\n\s+at\s/i)[0].trim();return!s||/^server error$/i.test(s)?{message:"The workspace could not be opened and the server did not say why. Try again in a moment.",retryable:!0}:{message:s.slice(0,500),retryable:!0}}(o);if(s.retryable&&e>0)return void window.setTimeout(()=>void u(e-1),3e3);m("error"),y(s.message),w(s.retryable)}};return u(2),()=>{t=!0,window.clearInterval(o)}},[e,l,i,c,d,h,E]);let O=(0,o.useCallback)(e=>{var t;let r=M.current;if(!r.service||!r.semanticIdentifier||!("ready"===(t={phase:q.current,inFlight:B.current,force:e?.force===!0,lastEnsuredAt:P.current,now:Date.now()}).phase&&!t.inFlight&&(t.force||null===t.lastEnsuredAt||t.now-t.lastEnsuredAt>=3e4)))return;B.current=!0;let s=R.current;r.ensureWorkspaceService("cloud"===r.runtimeSurface?{semanticIdentifier:r.semanticIdentifier,service:r.service,threadId:r.threadId,revalidate:!0}:{semanticIdentifier:r.semanticIdentifier,service:r.service,revalidate:!0}).then(e=>{s!==R.current||e.ready&&e.connectionToken&&(P.current=Date.now(),e.connectionToken!==I.current&&v(e.connectionToken))}).catch(()=>{}).finally(()=>{B.current=!1})},[]);return(0,o.useEffect)(()=>{if(!e||!l)return;let t=()=>{"visible"===document.visibilityState&&O()};return window.addEventListener("focus",t),document.addEventListener("visibilitychange",t),()=>{window.removeEventListener("focus",t),document.removeEventListener("visibilitychange",t)}},[e,l,O]),{phase:p,error:g,canRetry:b,connectionToken:x,resolvedPort:k,resolvedUrl:_,elapsedSeconds:N,retry:()=>C(e=>e+1),revalidate:O}},"a",0,function(e,t){let r="code"===e?"VS Code":"the terminal";return t<8?{title:`Opening ${r}…`,subtitle:"First boot or waking an archived workspace can take 1–2 minutes."}:t<40?{title:"Preparing your workspace…",subtitle:`Starting the sandbox and setting up this thread, then ${r}.`}:{title:"Still starting…",subtitle:"A cold sandbox or first-time workspace can take a few minutes."}}])},231687,e=>{var t=e.i(123574),r=e.i(314811),s=e.i(198126),n=e.i(846696),o=e.i(211926),a=e.i(271645),i=e.i(618566);let l="Freebuff's cloud workspaces are temporarily at capacity, so this project's workspace can't be started right now. This is a limit on our side, not your project: its storage is not full and nothing in it was changed. Please try again in a few minutes.";var c=e.i(239762),d=e.i(550841);function u(e){return!!e&&(e===c.e||e.includes("Retrying will not help"))}function f(e){let t=(0,o.f)(e,"");t&&(t.includes("[SandboxCapacity]")||null!==function(e){if(!e)return null;let t=e.toLowerCase();return/\btotal disk limit exceeded\b/.test(t)||t.includes("archiving your unused sandboxes")?"disk":/\btotal (?:cpu|memory) limit exceeded\b/.test(t)?"compute":t.includes("failed to place sandbox")||t.includes("placement timed out")||/\bsandbox creation failed on \d+ node/.test(t)?"placement":null}(t))||t===l?n.c.error("Cloud workspaces are temporarily at capacity",{description:l}):u(t)?n.c.error("This project's cloud workspace can't be opened",{description:t}):t===d.E?n.c.error("This project's cloud workspace isn't responding",{description:t}):function(e){if(!e)return!1;let t=e.toLowerCase();return t.includes("no space left")||t.includes("enospc")||t.includes("disk full")||t.includes("out of disk")||t.includes("disk quota")||t.includes("no space")||t.includes("disk")&&t.includes("full")}(t)?n.c.error("⚠️ Cloud VM is out of storage",{description:"Large installs filled the VM disk. Free up space or increase storage from the VM status menu."}):n.c.error("⚠️ Failed to connect to project")}e.s(["p",0,u,"O",0,function({semanticIdentifier:e,onSuccess:n,runtimeSurface:o="web",enabled:l=!0}){let c=(0,i.usePathname)(),d=(0,t.J)(s.f.codesandbox.management.verifyProjectAccessAndConnect),u=(0,t.J)(s.f.cloud.connection.verifyProjectAccessAndConnect),h="cloud"===o||c?.startsWith("/cloud/")===!0,p=h?u:d,m=(0,a.useRef)(!1),g=(0,a.useCallback)(async(t={})=>{if(!l||!e)return{success:!1,skipped:!0};try{return await p({semanticIdentifier:e}),{success:!0}}catch(e){return console.error("Failed to verify project access:",e),t.silentErrorToast||f(e),{success:!1,error:e}}},[l,e,p]),y=(0,r.f)({queryKey:["projectConnection",h?"cloud":"web",e],queryFn:async()=>{if(!e)throw Error("No semantic identifier provided");return await p({semanticIdentifier:e})},enabled:!!e&&l,staleTime:1/0,gcTime:1/0,refetchOnWindowFocus:!1,refetchOnReconnect:!1,refetchOnMount:!1,retry:!1});return(0,a.useEffect)(()=>{l&&(y.isSuccess&&!m.current?(m.current=!0,n?.()):y.isError&&!m.current&&(m.current=!0,console.error("Failed to verify project access:",y.error),f(y.error)))},[l,y.isSuccess,y.isError,y.error,n]),{isConnecting:!!l&&y.isPending,isError:!!l&&y.isError,error:l?y.error:null,isSuccess:!!l&&y.isSuccess,fetchStatus:y.fetchStatus,checkProjectConnection:g,refreshConnection:y.refetch}}],231687)},970832,e=>{e.s(["f",0,{credentialless:"true"}])},149341,e=>{let t="data-freebuff-preview-frame";e.s(["M",0,{[t]:""},"C",0,function(e,r=document){let s=e.source;if(!s)return!1;let n=r.querySelectorAll(`iframe[${t}]`);for(let e=0;e<n.length;e++)if(n[e].contentWindow===s)return!0;return!1}])},725161,916375,e=>{var t=e.i(387566);e.s(["f",()=>t.f],725161);var r=e.i(271645),s=e.i(643125);e.s(["f",0,function({project:e,entryPoints:t,activeEntryPoint:n,setActiveEntryPoint:o}){let a=(0,r.useMemo)(()=>{if(!e)return null;let t=(0,s.g)(e);if(!t)return null;if(n?.page?.page_display_url===null||n?.page?.page_display_url===void 0)try{return new URL("/",t).href}catch{return null}try{return new URL(n.page.page_display_url,t).href}catch{return null}},[e,n]),i=(0,r.useMemo)(()=>a?new URL(a):null,[a]),l=i?.host,c=i?.protocol,d=i?`${c}//${l}`:"",u=i?.pathname||"/",f=i?i.href:void 0,[h,p]=(0,r.useState)({stack:[u],index:0,iframeSrc:f,iframeKey:0,lastNavSource:"parent"});(0,r.useEffect)(()=>{f&&p(e=>(function(e,t,r){if(e.iframeSrc)try{let s=new URL(e.iframeSrc),n=new URL(t);if(s.origin===n.origin)return e;let o=e.stack[e.index]||r||"/";return{stack:[o],index:0,iframeSrc:new URL(o,n).href,iframeKey:e.iframeKey+1,lastNavSource:"parent"}}catch{return e}return{stack:[r||"/"],index:0,iframeSrc:t,iframeKey:e.iframeKey+1,lastNavSource:"parent"}})(e,f,u))},[f]);let[m,g]=(0,r.useState)(n?._id??null),y=n?._id??null;m!==y&&(g(y),u&&f&&p(e=>({stack:[u],index:0,iframeSrc:f,iframeKey:e.iframeKey+1,lastNavSource:"parent"})));let b=e=>""===e||null==e?"/":e;(0,r.useEffect)(()=>{function e(e){if(i&&e.origin===i.origin&&e.data&&"iframe-route-change"===e.data.type&&"string"==typeof e.data.path){let t=b(e.data.path);p(e=>{let r,s,{stack:n,index:o}=e;if(n[o]===t)return{...e,lastNavSource:"iframe"};let a=n.indexOf(t);return -1!==a?(r=n,s=a):s=(r=[...n.slice(0,o+1),t]).length-1,{stack:r,index:s,iframeSrc:e.iframeSrc,iframeKey:e.iframeKey,lastNavSource:"iframe"}})}}return window.addEventListener("message",e),()=>window.removeEventListener("message",e)},[i,d]);let w=h.index>0,x=h.index<h.stack.length-1,v=h.stack[h.index];return{navState:h,canGoBack:w,canGoForward:x,handleBack:()=>{w&&p(e=>{let t=e.index-1,r=e.stack[t];return{...e,index:t,iframeSrc:d?new URL(r,d).href:e.iframeSrc,iframeKey:Date.now(),lastNavSource:"parent"}})},handleForward:()=>{x&&p(e=>{let t=e.index+1,r=e.stack[t];return{...e,index:t,iframeSrc:d?new URL(r,d).href:e.iframeSrc,iframeKey:Date.now(),lastNavSource:"parent"}})},handleSidebarNavigation:e=>{t.find(t=>t._id===e)&&o(e)},activeEntryPointByPath:t&&v&&t.find(e=>b(e.page?.page_display_url)===b(v))||n,baseUrl:d}}],916375)}],730031,e=>{e.v({iframeWrapper:"Fi-3qW_iframeWrapper",mobileIframe:"Fi-3qW_mobileIframe",scaledIframe:"Fi-3qW_scaledIframe",selectingFrame:"Fi-3qW_selectingFrame"})}]);
